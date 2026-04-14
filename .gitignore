@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pth
+*.tmp
+checkpoints/
+logs/
+wandb/
+cache/
+data/
+weights/
+slurm-*.out
