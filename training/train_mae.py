@@ -18,6 +18,7 @@
 #   MLP (He et al. 2022 style), discard it after pre-training.
 
 import argparse
+import math
 import os
 import signal
 import sys
@@ -493,7 +494,9 @@ def main():
 
         global_bs    = effective_batch(step)
         local_target = global_bs // world
-        accum_steps  = max(1, local_target // samples_per_step_per_gpu)
+        # ceil so actual effective batch ≥ target regardless of gpu count/batch size
+        accum_steps  = max(1, math.ceil(local_target / samples_per_step_per_gpu))
+        actual_global_bs = samples_per_step_per_gpu * accum_steps * world
 
         optimizer.zero_grad(set_to_none=True)
 
@@ -570,7 +573,8 @@ def main():
             sps = samples_per_step_per_gpu * accum_steps * world * args.log_interval / (time.time() - t0)
             print(
                 f"step={step:6d}/{args.total_steps}  loss={avg:.4f}  "
-                f"lr={lr_:.2e}  global_bs={global_bs}  "
+                f"lr={lr_:.2e}  "
+                f"bs={actual_global_bs}(tgt={global_bs})  "
                 f"sps={sps:.0f}  accum={accum_steps}"
             )
             if use_wandb:
@@ -579,7 +583,8 @@ def main():
                     "train/loss": avg,
                     "train/lr": lr_,
                     "train/sps": sps,
-                    "train/global_bs": global_bs,
+                    "train/global_bs": actual_global_bs,
+                    "train/global_bs_target": global_bs,
                     "train/accum_steps": accum_steps,
                 }, step=step)
             loss_accum, n_accum = 0.0, 0
