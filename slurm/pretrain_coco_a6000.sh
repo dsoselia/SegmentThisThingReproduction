@@ -10,11 +10,13 @@
 #SBATCH --error=logs/mae_coco_%j.err
 #SBATCH --open-mode=append
 #SBATCH --partition=clip
+#SBATCH --account=clip
+#SBATCH --qos=high
 #SBATCH --gres=gpu:rtxa6000:2
-#SBATCH --ntasks-per-node=2
+#SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=128G
-#SBATCH --time=72:00:00
+#SBATCH --mem=64G
+#SBATCH --time=24:00:00
 #SBATCH --signal=SIGUSR1@120
 # Note: clip partition does not support --requeue; preemption is handled
 # via SIGUSR1 → clean checkpoint save → manual resubmission if needed.
@@ -51,7 +53,7 @@ source /cmlscratch/dsoselia/miniconda3/etc/profile.d/conda.sh
 conda activate torch-py313
 cd "${REPO_DIR}"
 
-NPROC=${SLURM_NTASKS_PER_NODE:-2}
+NPROC=2  # hardcoded: 2x RTX A6000 requested via --gres
 MASTER_PORT=$(( 29000 + SLURM_JOB_ID % 1000 ))
 
 RESUME_ARG=""
