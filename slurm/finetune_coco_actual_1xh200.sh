@@ -1,20 +1,23 @@
 #!/bin/bash
-# Segmentation fine-tuning using COCO train2017 + instance annotations.
-# 860K annotated instances across 118K images.
+# Segmentation fine-tuning — actual full run, 1×H200.
+# Grad accumulation auto-adjusts (×2) to maintain 2048 global batch size.
+# 250K steps. Requires mae_coco_lr_actual/final.pth from pretrain.
 #
-# Submit (H200): sbatch slurm/finetune_coco.sh
-# Submit (any GPU): sbatch --partition=clip --gres=gpu:rtxa6000:4 slurm/finetune_coco.sh
+# NOTE: val loader uses DataLoader workers which fork after CUDA init on single-rank DDP.
+# If training hangs during val pass, resubmit with --val-interval 0 to disable val.
+#
+# Submit: sbatch slurm/finetune_coco_actual_1xh200.sh
 
-#SBATCH --job-name=stt-seg-coco
-#SBATCH --output=logs/seg_coco_%j.out
-#SBATCH --error=logs/seg_coco_%j.err
+#SBATCH --job-name=stt-seg-act-1h
+#SBATCH --output=logs/seg_actual_1xh200_%j.out
+#SBATCH --error=logs/seg_actual_1xh200_%j.err
 #SBATCH --open-mode=append
 #SBATCH --partition=cml-scavenger
-#SBATCH --gres=gpu:h200-sxm:4
 #SBATCH --account=cml-scavenger
-#SBATCH --ntasks-per-node=4
+#SBATCH --gres=gpu:h200-sxm:1
+#SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=320G
+#SBATCH --mem=128G
 #SBATCH --time=72:00:00
 #SBATCH --requeue
 #SBATCH --signal=SIGUSR1@120
@@ -25,38 +28,33 @@ REPO_DIR=/cmlscratch/dsoselia/SegmentThisThingRectilinear/SegmentThisThingReprod
 COCO_ROOT=/fs/cml-datasets/coco
 COCO_IMAGES=${COCO_ROOT}/images/train2017
 COCO_ANN=${COCO_ROOT}/annotations/instances_train2017.json
-OUTPUT_DIR=${REPO_DIR}/checkpoints/seg_coco_lr
-MAE_CKPT=${REPO_DIR}/checkpoints/mae_coco_lr/final.pth
+OUTPUT_DIR=${REPO_DIR}/checkpoints/seg_coco_lr_actual
+MAE_CKPT=${REPO_DIR}/checkpoints/mae_coco_lr_actual/final.pth
 mkdir -p "${OUTPUT_DIR}" "${REPO_DIR}/logs"
 
-# ── Stage images to local scratch ────────────────────────────────────────────
-# Use a fixed path (no PID) so reruns on the same node skip the 25-min rsync.
 LOCAL_IMAGES=/tmp/stt_coco_train2017
 EXPECTED=118287
-# Remove stale PID-based staging dirs left by cancelled jobs
 rm -rf /tmp/coco_train2017_* 2>/dev/null || true
 mkdir -p "${LOCAL_IMAGES}"
 ACTUAL=$(find "${LOCAL_IMAGES}" -maxdepth 1 -name '*.jpg' | wc -l)
 if [ "${ACTUAL}" -lt "${EXPECTED}" ]; then
-    # Verify enough free space (~20 GB needed)
     FREE_KB=$(df -k /tmp | awk 'NR==2 {print $4}')
     if [ "${FREE_KB}" -lt 20971520 ]; then
-        echo "[finetune_coco] ERROR: /tmp has only $((FREE_KB/1024)) MB free (need ~20 GB). Aborting."
+        echo "[finetune_actual] ERROR: /tmp has only $((FREE_KB/1024)) MB free (need ~20 GB). Aborting."
         exit 1
     fi
-    echo "[finetune_coco] Staging COCO train2017 to ${LOCAL_IMAGES} (have ${ACTUAL}/${EXPECTED}) ..."
+    echo "[finetune_actual] Staging COCO train2017 to ${LOCAL_IMAGES} (have ${ACTUAL}/${EXPECTED}) ..."
     rsync -a --no-perms --update "${COCO_IMAGES}/" "${LOCAL_IMAGES}/"
-    echo "[finetune_coco] Staged: $(find ${LOCAL_IMAGES} -maxdepth 1 -name '*.jpg' | wc -l) images"
+    echo "[finetune_actual] Staged: $(find ${LOCAL_IMAGES} -maxdepth 1 -name '*.jpg' | wc -l) images"
 else
-    echo "[finetune_coco] Reusing cached staging at ${LOCAL_IMAGES} (${ACTUAL} images)"
+    echo "[finetune_actual] Reusing cached staging at ${LOCAL_IMAGES} (${ACTUAL} images)"
 fi
 
-# ── Environment ───────────────────────────────────────────────────────────────
 source /cmlscratch/dsoselia/miniconda3/etc/profile.d/conda.sh
 conda activate torch-py313
 cd "${REPO_DIR}"
 
-NPROC=${SLURM_NTASKS_PER_NODE:-4}
+NPROC=${SLURM_NTASKS_PER_NODE:-1}
 MASTER_PORT=$(( 29000 + SLURM_JOB_ID % 1000 ))
 
 PRETRAIN_ARG=""
@@ -84,14 +82,14 @@ torchrun \
     --weight-decay 0.001 \
     --max-fov 16 \
     --images-per-gpu 64 \
-    --num-workers 6 \
+    --num-workers 2 \
     --log-interval 50 \
-    --save-interval 500 \
+    --save-interval 1000 \
     --val-data-root /fs/cml-datasets/coco/images/val2017 \
     --val-ann-file /fs/cml-datasets/coco/annotations/instances_val2017.json \
     --val-images 128 \
     --val-interval 2500 \
-    --wandb-project SegmentLogRectNexus \
-    --wandb-run-name seg-b-coco-lr \
+    --wandb-project SegmentLogRectNexus_actual \
+    --wandb-run-name seg-b-coco-lr-actual \
     ${PRETRAIN_ARG} \
     ${RESUME_ARG}

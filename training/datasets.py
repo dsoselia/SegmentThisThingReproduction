@@ -390,47 +390,63 @@ def batch_foveate_images(
     """
     Batched GPU foveation of image crops.
 
+    Supports both the concentric-ring Foveator and LogRectilinearFoveator.
+    Dispatch is based on whether the foveator has precomputed `lower_coords`.
+
     Returns: (B, N, 3, ts, ts) float32 — normalized pixel averages per token.
     Values are in [0, 255] (NOT yet ImageNet-normalized).
     """
-    from segment_this_thing.foveation import generate_grid_coords_2d
-
     B, H, W, C = images_hwc.shape
     ts = foveator.token_size
     N = foveator.get_num_tokens()
     device = images_hwc.device
 
-    # (B, C, H, W) float for integral image
+    # Build integral image (common to both paths)
     img_f = images_hwc.permute(0, 3, 1, 2).float()  # (B, 3, H, W)
     padded = F.pad(img_f, (1, 0, 1, 0), value=0.0)  # (B, 3, H+1, W+1)
     integral = padded.cumsum(dim=3).cumsum(dim=2)     # (B, 3, H+1, W+1)
     W1 = W + 1
 
-    # Token pixel coordinate grids (on device)
-    grid = generate_grid_coords_2d(ts).to(device)           # (ts, ts, 2)
-    lower = (
-        foveator.token_corner_indices.view(N, 1, 1, 2)
-        + foveator.token_strides.view(N, 1, 1, 1) * grid.unsqueeze(0)
-    )  # (N, ts, ts, 2)  — x in [...,0], y in [...,1]
-    upper = lower + foveator.token_strides.view(N, 1, 1, 1)  # (N, ts, ts, 2)
-
-    lx, ly = lower[..., 0].long(), lower[..., 1].long()  # (N, ts, ts)
-    ux, uy = upper[..., 0].long(), upper[..., 1].long()
-
-    # Flat index into integral image spatial dim (H+1, W+1)
     def flat(y, x):
         return (y * W1 + x).view(1, 1, -1).expand(B, C, -1)  # (B, C, N*ts*ts)
 
     int_flat = integral.flatten(2)  # (B, C, (H+1)*(W+1))
-    areas = (
-        int_flat.gather(2, flat(uy, ux))
-        - int_flat.gather(2, flat(uy, lx))
-        - int_flat.gather(2, flat(ly, ux))
-        + int_flat.gather(2, flat(ly, lx))
-    )  # (B, C, N*ts*ts)
 
-    areas = areas.view(B, C, N, ts, ts)
-    tokens = areas / foveator.token_strides.square().view(1, 1, N, 1, 1).float()
+    if hasattr(foveator, 'lower_coords'):
+        # ── Log-rectilinear path: per-cell coords precomputed ─────────────────
+        lx = foveator.lower_coords[..., 0].long()   # (N, ts, ts)
+        ly = foveator.lower_coords[..., 1].long()
+        ux = foveator.upper_coords[..., 0].long()
+        uy = foveator.upper_coords[..., 1].long()
+        areas = (
+            int_flat.gather(2, flat(uy, ux))
+            - int_flat.gather(2, flat(uy, lx))
+            - int_flat.gather(2, flat(ly, ux))
+            + int_flat.gather(2, flat(ly, lx))
+        )  # (B, C, N*ts*ts)
+        areas = areas.view(B, C, N, ts, ts)
+        # Clamp: float32 cumsum precision errors can push values slightly outside [0,255]
+        tokens = (areas / foveator.pixel_areas.view(1, 1, N, ts, ts)).clamp(0.0, 255.0)
+    else:
+        # ── Original concentric-ring path: per-token uniform stride ───────────
+        from segment_this_thing.foveation import generate_grid_coords_2d
+        grid = generate_grid_coords_2d(ts).to(device)           # (ts, ts, 2)
+        lower = (
+            foveator.token_corner_indices.view(N, 1, 1, 2)
+            + foveator.token_strides.view(N, 1, 1, 1) * grid.unsqueeze(0)
+        )  # (N, ts, ts, 2)
+        upper = lower + foveator.token_strides.view(N, 1, 1, 1)
+        lx, ly = lower[..., 0].long(), lower[..., 1].long()
+        ux, uy = upper[..., 0].long(), upper[..., 1].long()
+        areas = (
+            int_flat.gather(2, flat(uy, ux))
+            - int_flat.gather(2, flat(uy, lx))
+            - int_flat.gather(2, flat(ly, ux))
+            + int_flat.gather(2, flat(ly, lx))
+        )  # (B, C, N*ts*ts)
+        areas = areas.view(B, C, N, ts, ts)
+        tokens = areas / foveator.token_strides.square().view(1, 1, N, 1, 1).float()
+
     return tokens.permute(0, 2, 1, 3, 4)  # (B, N, C, ts, ts)  values in [0,255]
 
 
@@ -441,10 +457,10 @@ def batch_foveate_masks(
     """
     Batched GPU foveation of binary mask crops.
 
+    Supports both the concentric-ring Foveator and LogRectilinearFoveator.
+
     Returns: (B, N, ts, ts) float32 — proportion of masked pixels per token cell.
     """
-    from segment_this_thing.foveation import generate_grid_coords_2d
-
     B, H, W = masks_hw.shape
     ts = foveator.token_size
     N = foveator.get_num_tokens()
@@ -454,29 +470,43 @@ def batch_foveate_masks(
     integral = padded.cumsum(dim=3).cumsum(dim=2)                     # (B, 1, H+1, W+1)
     W1 = W + 1
 
-    grid = generate_grid_coords_2d(ts).to(device)
-    lower = (
-        foveator.token_corner_indices.view(N, 1, 1, 2)
-        + foveator.token_strides.view(N, 1, 1, 1) * grid.unsqueeze(0)
-    )
-    upper = lower + foveator.token_strides.view(N, 1, 1, 1)
-
-    lx, ly = lower[..., 0].long(), lower[..., 1].long()
-    ux, uy = upper[..., 0].long(), upper[..., 1].long()
-
     def flat(y, x):
         return (y * W1 + x).view(1, 1, -1).expand(B, 1, -1)
 
     int_flat = integral.flatten(2)
-    areas = (
-        int_flat.gather(2, flat(uy, ux))
-        - int_flat.gather(2, flat(uy, lx))
-        - int_flat.gather(2, flat(ly, ux))
-        + int_flat.gather(2, flat(ly, lx))
-    )  # (B, 1, N*ts*ts)
 
-    areas = areas.view(B, N, ts, ts)
-    proportions = areas / foveator.token_strides.square().view(1, N, 1, 1).float()
+    if hasattr(foveator, 'lower_coords'):
+        # ── Log-rectilinear path ──────────────────────────────────────────────
+        lx = foveator.lower_coords[..., 0].long()
+        ly = foveator.lower_coords[..., 1].long()
+        ux = foveator.upper_coords[..., 0].long()
+        uy = foveator.upper_coords[..., 1].long()
+        areas = (
+            int_flat.gather(2, flat(uy, ux))
+            - int_flat.gather(2, flat(uy, lx))
+            - int_flat.gather(2, flat(ly, ux))
+            + int_flat.gather(2, flat(ly, lx))
+        ).view(B, N, ts, ts)
+        proportions = (areas / foveator.pixel_areas.view(1, N, ts, ts)).clamp(0.0, 1.0)
+    else:
+        # ── Original concentric-ring path ─────────────────────────────────────
+        from segment_this_thing.foveation import generate_grid_coords_2d
+        grid = generate_grid_coords_2d(ts).to(device)
+        lower = (
+            foveator.token_corner_indices.view(N, 1, 1, 2)
+            + foveator.token_strides.view(N, 1, 1, 1) * grid.unsqueeze(0)
+        )
+        upper = lower + foveator.token_strides.view(N, 1, 1, 1)
+        lx, ly = lower[..., 0].long(), lower[..., 1].long()
+        ux, uy = upper[..., 0].long(), upper[..., 1].long()
+        areas = (
+            int_flat.gather(2, flat(uy, ux))
+            - int_flat.gather(2, flat(uy, lx))
+            - int_flat.gather(2, flat(ly, ux))
+            + int_flat.gather(2, flat(ly, lx))
+        ).view(B, N, ts, ts)
+        proportions = areas / foveator.token_strides.square().view(1, N, 1, 1).float()
+
     return proportions  # (B, N, ts, ts)
 
 

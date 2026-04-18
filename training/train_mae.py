@@ -37,7 +37,6 @@ from torch.utils.data.distributed import DistributedSampler
 sys.path.insert(0, str(Path(__file__).parent.parent / "repo"))
 
 from segment_this_thing import (
-    Foveator,
     build_segment_this_thing_b,
     build_segment_this_thing_l,
     build_segment_this_thing_h,
@@ -51,7 +50,11 @@ from datasets import (
     multi_fov_collate,
     batch_foveate_images,
 )
+from foveation_lr import LogRectilinearFoveator
 from lr_scheduler import WarmupThenConstant
+
+# Center 4×4 token indices for MAE visualization (rows 4-7, cols 4-7 in 13×13 grid)
+_LR_VIS_IDX = [r * 13 + c for r in range(4, 8) for c in range(4, 8)]
 
 MODEL_BUILDERS = {
     "b": build_segment_this_thing_b,
@@ -142,10 +145,13 @@ class MAEDecoder(nn.Module):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _make_recon_grid(tokens_gt, mask_idx, recon, imagenet_std, imagenet_mean,
-                     n_show=4, grid_w=4):
+                     n_show=4, grid_w=4, vis_indices=None):
     """
     Build a PIL image: rows of [GT patches | masked input | reconstruction].
-    Uses only the first grid_w² tokens (finest foveation scale, stride=1).
+
+    vis_indices: list of token indices to display (default: first grid_w² tokens,
+                 which are the finest-resolution center tokens for the ring foveator).
+                 For LogRectilinearFoveator pass _LR_VIS_IDX (center 4×4 tokens).
     Returns a PIL.Image or None on any error.
     """
     try:
@@ -154,7 +160,14 @@ def _make_recon_grid(tokens_gt, mask_idx, recon, imagenet_std, imagenet_mean,
 
         B, N, C, P, _ = tokens_gt.shape
         n_show = min(n_show, B)
-        grid_n = grid_w * grid_w  # 16 tokens at finest scale
+        grid_n = grid_w * grid_w  # 16 tokens to display
+
+        if vis_indices is None:
+            idx = list(range(grid_n))
+        else:
+            idx = list(vis_indices)[:grid_n]
+
+        idx_t = torch.tensor(idx, dtype=torch.long, device=tokens_gt.device)
 
         # imagenet_std/mean are (1,1,3,1,1) — squeeze to (1,3,1,1) for broadcast
         std  = imagenet_std.squeeze(0).float()
@@ -171,19 +184,19 @@ def _make_recon_grid(tokens_gt, mask_idx, recon, imagenet_std, imagenet_mean,
 
         sample_rows = []
         for i in range(n_show):
-            gt_p  = tokens_gt[i, :grid_n].float()                     # (16, 3, P, P)
+            gt_p  = tokens_gt[i].index_select(0, idx_t).float()       # (16, 3, P, P)
             gt_p  = (gt_p * std + mean).clamp(0, 1)
 
-            rec_p = recon[i, :grid_n].float().view(grid_n, C, P, P)
+            rec_p = recon[i].index_select(0, idx_t).float().view(grid_n, C, P, P)
             rec_p = (rec_p * std + mean).clamp(0, 1)
 
             is_masked_i = torch.zeros(N, dtype=torch.bool, device=tokens_gt.device)
             is_masked_i.scatter_(0, mask_idx[i], True)
 
             msk_p = gt_p.clone()
-            for t in range(grid_n):
-                if is_masked_i[t]:
-                    msk_p[t] = 0.5   # gray placeholder
+            for t_local, t_global in enumerate(idx):
+                if is_masked_i[t_global]:
+                    msk_p[t_local] = 0.5   # gray placeholder
 
             gt_img  = patches_to_img(gt_p)
             msk_img = patches_to_img(msk_p)
@@ -269,10 +282,11 @@ def run_val(encoder_mod, mae_mask_token_mod, mae_dec_mod, val_loader,
         if first_data is not None:
             tokens_gt, mask_idx_0, recon_0 = first_data
             grid = _make_recon_grid(tokens_gt, mask_idx_0, recon_0,
-                                    imagenet_std, imagenet_mean, n_show=4)
+                                    imagenet_std, imagenet_mean, n_show=4,
+                                    vis_indices=_LR_VIS_IDX)
             if grid is not None:
                 log_dict["val/reconstruction"] = wandb.Image(
-                    grid, caption=f"step {step}  |  GT | masked | recon  (finest-scale tokens)"
+                    grid, caption=f"step {step}  |  GT | masked | recon  (center tokens)"
                 )
 
         wandb.log(log_dict, step=step)
@@ -359,13 +373,9 @@ def main():
             use_wandb = False
 
     token_size = 16
-    foveator_cpu = Foveator(
-        token_size=token_size, strides=[1, 2, 4, 6, 8], grid_sizes=[4, 4, 6, 8, 10]
-    )
-    foveator_gpu = Foveator(
-        token_size=token_size, strides=[1, 2, 4, 6, 8], grid_sizes=[4, 4, 6, 8, 10]
-    ).to(device)
-    num_tokens = foveator_cpu.get_num_tokens()  # 172
+    foveator_cpu = LogRectilinearFoveator()
+    foveator_gpu = LogRectilinearFoveator().to(device)
+    num_tokens = foveator_cpu.get_num_tokens()  # 169
 
     imagenet_mean = get_imagenet_mean(device).view(1, 1, 3, 1, 1)
     imagenet_std  = get_imagenet_std(device).view(1, 1, 3, 1, 1)

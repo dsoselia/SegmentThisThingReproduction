@@ -21,9 +21,9 @@
 
 set -e
 
-REPO_DIR=/cmlscratch/dsoselia/SegmentThisThing
+REPO_DIR=/cmlscratch/dsoselia/SegmentThisThingRectilinear/SegmentThisThingReproduction
 COCO_IMAGES=/fs/cml-datasets/coco/images/train2017
-OUTPUT_DIR=${REPO_DIR}/checkpoints/mae_coco
+OUTPUT_DIR=${REPO_DIR}/checkpoints/mae_coco_lr
 mkdir -p "${OUTPUT_DIR}" "${REPO_DIR}/logs"
 
 # ── Stage images to local scratch ────────────────────────────────────────────
@@ -83,6 +83,6 @@ torchrun \
     --keep-milestones 3 \
     --val-data-root /fs/cml-datasets/coco/images/val2017 \
     --val-images 256 \
-    --wandb-project segment-this-thing \
-    --wandb-run-name mae-b-coco \
+    --wandb-project SegmentLogRectNexus \
+    --wandb-run-name mae-b-coco-lr \
     ${RESUME_ARG}

@@ -41,7 +41,6 @@ from torch.utils.data.distributed import DistributedSampler
 sys.path.insert(0, str(Path(__file__).parent.parent / "repo"))
 
 from segment_this_thing import (
-    Foveator,
     build_segment_this_thing_b,
     build_segment_this_thing_l,
     build_segment_this_thing_h,
@@ -56,8 +55,68 @@ from datasets import (
     batch_foveate_images,
     batch_foveate_masks,
 )
-from losses import segmentation_loss
+from foveation_lr import LogRectilinearFoveator
+from losses import segmentation_loss, expected_iou
 from lr_scheduler import WarmupCosineScheduler
+
+@torch.no_grad()
+def run_val_seg(model_mod, foveator, val_loader, imagenet_mean, imagenet_std,
+                device, step, use_wandb):
+    """Validation pass on rank 0 only. Logs val/loss, val/exp_iou, val/pred_iou."""
+    model_mod.eval()
+    total_loss = 0.0
+    total_exp_iou = 0.0
+    total_pred_iou = 0.0
+    n_batches = 0
+
+    for img_crops, mask_crops, valid_masks in val_loader:
+        img_crops   = img_crops.to(device)
+        mask_crops  = mask_crops.to(device)
+        valid_masks = valid_masks.to(device)
+
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            tokens_u8 = batch_foveate_images(foveator, img_crops)
+            tokens    = (tokens_u8 / 255.0 - imagenet_mean) / imagenet_std
+            gt_masks  = batch_foveate_masks(foveator, mask_crops)
+            pred_masks, pred_ious = model_mod(tokens, valid_masks)
+            loss = segmentation_loss(pred_masks, pred_ious, gt_masks, valid_masks)
+
+        B = pred_masks.shape[0]
+        batch_exp_iou = 0.0
+        batch_pred_iou = 0.0
+        count = 0
+        for b in range(B):
+            valid = valid_masks[b]
+            if valid.sum() == 0:
+                continue
+            pred_b  = pred_masks[b, :, valid].flatten(1)   # (K, M)
+            gt_b    = gt_masks[b, valid].flatten()           # (M,)
+            e_ious  = expected_iou(pred_b.float(), gt_b.float())  # (K,)
+            best_k  = e_ious.argmax()
+            batch_exp_iou  += e_ious[best_k].item()
+            batch_pred_iou += pred_ious[b, best_k].sigmoid().item()
+            count += 1
+
+        total_loss     += loss.item()
+        total_exp_iou  += batch_exp_iou  / max(count, 1)
+        total_pred_iou += batch_pred_iou / max(count, 1)
+        n_batches += 1
+
+    avg_loss     = total_loss     / max(n_batches, 1)
+    avg_exp_iou  = total_exp_iou  / max(n_batches, 1)
+    avg_pred_iou = total_pred_iou / max(n_batches, 1)
+
+    print(f"  val/loss={avg_loss:.4f}  val/exp_iou={avg_exp_iou:.4f}  val/pred_iou={avg_pred_iou:.4f}")
+    if use_wandb:
+        import wandb
+        wandb.log({
+            "val/loss":     avg_loss,
+            "val/exp_iou":  avg_exp_iou,
+            "val/pred_iou": avg_pred_iou,
+        }, step=step)
+
+    model_mod.train()
+
 
 MODEL_BUILDERS = {
     "b": build_segment_this_thing_b,
@@ -104,6 +163,14 @@ def main():
     parser.add_argument("--num-workers",   type=int, default=8)
     parser.add_argument("--log-interval",  type=int, default=20)
     parser.add_argument("--save-interval", type=int, default=2_500)
+    parser.add_argument("--val-data-root",  default=None,
+                        help="COCO val2017 images directory")
+    parser.add_argument("--val-ann-file",   default=None,
+                        help="COCO val2017 instances annotation JSON")
+    parser.add_argument("--val-images",     type=int, default=64,
+                        help="Number of val images (default 64)")
+    parser.add_argument("--val-interval",   type=int, default=500,
+                        help="Run val every N steps (0 = disable)")
     parser.add_argument("--compile", action="store_true",
                         help="Use torch.compile for extra speed")
     parser.add_argument("--wandb-project", default="segment-this-thing",
@@ -136,24 +203,30 @@ def main():
     if use_wandb:
         try:
             import wandb
+            # Persist run ID so restarts continue the same run (train+val on one timeline)
+            _run_id_file = os.path.join(args.output_dir, "wandb_run_id.txt")
+            _wandb_id = None
+            if os.path.exists(_run_id_file):
+                with open(_run_id_file) as _f:
+                    _wandb_id = _f.read().strip() or None
             wandb.init(
                 project=args.wandb_project,
                 name=args.wandb_run_name or f"seg-{args.model_size}",
+                id=_wandb_id,
                 config=vars(args),
                 resume="allow",
             )
+            # Save run ID for future restarts
+            with open(_run_id_file, "w") as _f:
+                _f.write(wandb.run.id)
         except Exception as e:
             print(f"W&B init failed ({e}), continuing without it.")
             use_wandb = False
 
     # ── Foveator (CPU for dataset, GPU for tokenization) ─────────────────
     token_size = 16
-    foveator_cpu = Foveator(
-        token_size=token_size, strides=[1, 2, 4, 6, 8], grid_sizes=[4, 4, 6, 8, 10]
-    )
-    foveator_gpu = Foveator(
-        token_size=token_size, strides=[1, 2, 4, 6, 8], grid_sizes=[4, 4, 6, 8, 10]
-    ).to(device)
+    foveator_cpu = LogRectilinearFoveator()
+    foveator_gpu = LogRectilinearFoveator().to(device)
 
     imagenet_mean = get_imagenet_mean(device).view(1, 1, 3, 1, 1)  # (1,1,3,1,1)
     imagenet_std  = get_imagenet_std(device).view(1, 1, 3, 1, 1)
@@ -186,6 +259,28 @@ def main():
         persistent_workers=True,
         prefetch_factor=2,
     )
+
+    # ── Val loader (rank 0 only, no DDP) ─────────────────────────────────
+    val_loader = None
+    if is_main and args.val_data_root and args.val_ann_file and args.val_interval > 0:
+        val_ds = COCOMultiFovDataset(
+            args.val_data_root, foveator_cpu,
+            ann_file=args.val_ann_file,
+            max_fov=args.max_fov,
+            is_mae=False,
+        )
+        n_val = min(args.val_images, len(val_ds))
+        val_subset = torch.utils.data.Subset(val_ds, list(range(n_val)))
+        val_loader = DataLoader(
+            val_subset,
+            batch_size=args.images_per_gpu,
+            shuffle=False,
+            num_workers=2,
+            collate_fn=multi_fov_collate,
+            pin_memory=True,
+            drop_last=False,
+        )
+        print(f"Val loader: {n_val} images, interval={args.val_interval}")
 
     # ── Model ─────────────────────────────────────────────────────────────
     num_tokens = foveator_cpu.get_num_tokens()
@@ -234,6 +329,11 @@ def main():
         start_step = ckpt.get("step", 0)
         if is_main:
             print(f"Resumed from step {start_step}")
+
+    # ── Initial val (on resume, so we have a baseline at the resumed step) ──
+    if val_loader is not None and start_step > 0:
+        run_val_seg(model.module, foveator_gpu, val_loader,
+                    imagenet_mean, imagenet_std, device, start_step, use_wandb)
 
     # ── Training ──────────────────────────────────────────────────────────
     model.train()
@@ -339,6 +439,10 @@ def main():
             save_checkpoint(state, ckpt_path)
             save_checkpoint(state, os.path.join(args.output_dir, "latest.pth"))
             print(f"Saved {ckpt_path}")
+
+        if val_loader is not None and step % args.val_interval == 0:
+            run_val_seg(model.module, foveator_gpu, val_loader,
+                        imagenet_mean, imagenet_std, device, step, use_wandb)
 
     if is_main:
         save_checkpoint(_full_state(), os.path.join(args.output_dir, "final.pth"))
