@@ -34,6 +34,7 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -62,16 +63,25 @@ from lr_scheduler import WarmupCosineScheduler
 @torch.no_grad()
 def run_val_seg(model_mod, foveator, val_loader, imagenet_mean, imagenet_std,
                 device, step, use_wandb):
-    """Validation pass on rank 0 only. Logs val/loss, val/exp_iou, val/pred_iou."""
+    """Validation pass on rank 0 only.
+
+    Logs:
+      val/loss, val/exp_iou, val/pred_iou  — computed in foveated token space
+      val/crop_iou                          — binary IoU in 1280×1280 crop space
+                                             (method-agnostic; comparable across foveators)
+    """
     model_mod.eval()
     total_loss = 0.0
     total_exp_iou = 0.0
     total_pred_iou = 0.0
+    total_crop_iou = 0.0
     n_batches = 0
+
+    has_unwarp = hasattr(foveator, 'unwarp_to_crop')
 
     for img_crops, mask_crops, valid_masks in val_loader:
         img_crops   = img_crops.to(device)
-        mask_crops  = mask_crops.to(device)
+        mask_crops  = mask_crops.to(device)   # (B, 1280, 1280) float32 GT in crop space
         valid_masks = valid_masks.to(device)
 
         with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -84,15 +94,18 @@ def run_val_seg(model_mod, foveator, val_loader, imagenet_mean, imagenet_std,
         B = pred_masks.shape[0]
         batch_exp_iou = 0.0
         batch_pred_iou = 0.0
+        best_k_per_sample = []
         count = 0
         for b in range(B):
             valid = valid_masks[b]
             if valid.sum() == 0:
+                best_k_per_sample.append(0)
                 continue
             pred_b  = pred_masks[b, :, valid].flatten(1)   # (K, M)
             gt_b    = gt_masks[b, valid].flatten()           # (M,)
             e_ious  = expected_iou(pred_b.float(), gt_b.float())  # (K,)
-            best_k  = e_ious.argmax()
+            best_k  = e_ious.argmax().item()
+            best_k_per_sample.append(best_k)
             batch_exp_iou  += e_ious[best_k].item()
             batch_pred_iou += pred_ious[b, best_k].sigmoid().item()
             count += 1
@@ -100,20 +113,46 @@ def run_val_seg(model_mod, foveator, val_loader, imagenet_mean, imagenet_std,
         total_loss     += loss.item()
         total_exp_iou  += batch_exp_iou  / max(count, 1)
         total_pred_iou += batch_pred_iou / max(count, 1)
+
+        # ── Crop-space IoU (method-agnostic) ──────────────────────────────────
+        if has_unwarp:
+            # Select best mask per sample: (B, N, P, P)
+            best_pred = torch.stack(
+                [pred_masks[b, best_k_per_sample[b]] for b in range(B)]
+            ).float()  # (B, N, P, P)
+            # Downsample to token resolution if decoder upsampled spatially
+            P = best_pred.shape[-1]
+            if P != foveator.token_size:
+                best_pred = F.adaptive_avg_pool2d(
+                    best_pred.flatten(0, 1).unsqueeze(1), foveator.token_size
+                ).squeeze(1).unflatten(0, (B, -1))
+            soft_pred = best_pred.sigmoid()                     # (B, N, 16, 16) in [0,1]
+            pred_crop = foveator.unwarp_to_crop(soft_pred)      # (B, 1280, 1280)
+            pred_bin  = pred_crop > 0.5
+            gt_bin    = mask_crops.float() > 0.5
+            inter = (pred_bin & gt_bin).float().flatten(1).sum(1)   # (B,)
+            union = (pred_bin | gt_bin).float().flatten(1).sum(1)   # (B,)
+            total_crop_iou += (inter / (union + 1e-6)).mean().item()
+
         n_batches += 1
 
     avg_loss     = total_loss     / max(n_batches, 1)
     avg_exp_iou  = total_exp_iou  / max(n_batches, 1)
     avg_pred_iou = total_pred_iou / max(n_batches, 1)
+    avg_crop_iou = total_crop_iou / max(n_batches, 1) if has_unwarp else float('nan')
 
-    print(f"  val/loss={avg_loss:.4f}  val/exp_iou={avg_exp_iou:.4f}  val/pred_iou={avg_pred_iou:.4f}")
+    print(f"  val/loss={avg_loss:.4f}  val/exp_iou={avg_exp_iou:.4f}"
+          f"  val/pred_iou={avg_pred_iou:.4f}  val/crop_iou={avg_crop_iou:.4f}")
     if use_wandb:
         import wandb
-        wandb.log({
+        log_dict = {
             "val/loss":     avg_loss,
             "val/exp_iou":  avg_exp_iou,
             "val/pred_iou": avg_pred_iou,
-        }, step=step)
+        }
+        if has_unwarp:
+            log_dict["val/crop_iou"] = avg_crop_iou
+        wandb.log(log_dict, step=step)
 
     model_mod.train()
 

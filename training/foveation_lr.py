@@ -50,6 +50,33 @@ def _lr_map(du: np.ndarray) -> np.ndarray:
     return dx + _CROP_HALF
 
 
+def _precompute_crop_to_token_map() -> np.ndarray:
+    """
+    Returns (1280*1280,) int64: flat crop-pixel index → flat token-cell index (n*P*P + py*P + px).
+
+    Uses separability of the log-rectilinear transform: the column/px assignment
+    of a crop pixel depends only on its x-coordinate, and row/py only on y.
+    This lets us build the full map with two searchsorted calls and broadcasting.
+    """
+    G, ts = _GRID_SIZE, _TOKEN_SIZE
+    buf_boundaries = np.arange(_BUF_SIZE + 1, dtype=np.float64)           # (209,)
+    x_src_i = np.floor(_lr_map(buf_boundaries - _BUF_HALF)).astype(np.int32)  # (209,)
+
+    xs = np.arange(_CROP_SIZE)
+    u_of_x  = np.searchsorted(x_src_i[1:], xs, side='right')  # (1280,) in [0,207]
+    col_of_x = u_of_x // ts
+    px_of_x  = u_of_x % ts
+
+    ys = np.arange(_CROP_SIZE)
+    u_of_y   = np.searchsorted(x_src_i[1:], ys, side='right')  # same axis (square)
+    row_of_y = u_of_y // ts
+    py_of_y  = u_of_y % ts
+
+    n_map    = (row_of_y[:, None] * G  + col_of_x[None, :]).astype(np.int64)    # (H, W)
+    cell_map = n_map * ts * ts + py_of_y[:, None] * ts + px_of_x[None, :]       # (H, W)
+    return cell_map.reshape(-1)  # (1280*1280,)
+
+
 def _precompute_coords():
     """
     Precompute per-cell source pixel coordinates for all 169 × 16 × 16 cells.
@@ -147,11 +174,12 @@ class LogRectilinearFoveator(nn.Module):
     def __init__(self):
         super().__init__()
         lc, uc, pa, tl, tu = _precompute_coords()
-        self.register_buffer("lower_coords",  torch.from_numpy(lc))
-        self.register_buffer("upper_coords",  torch.from_numpy(uc))
-        self.register_buffer("pixel_areas",   torch.from_numpy(pa))
-        self.register_buffer("_token_lower",  torch.from_numpy(tl))
-        self.register_buffer("_token_upper",  torch.from_numpy(tu))
+        self.register_buffer("lower_coords",       torch.from_numpy(lc))
+        self.register_buffer("upper_coords",       torch.from_numpy(uc))
+        self.register_buffer("pixel_areas",        torch.from_numpy(pa))
+        self.register_buffer("_token_lower",       torch.from_numpy(tl))
+        self.register_buffer("_token_upper",       torch.from_numpy(tu))
+        self.register_buffer("crop_to_token_cell", torch.from_numpy(_precompute_crop_to_token_map()))
 
     # ── Foveator-compatible interface ─────────────────────────────────────────
 
@@ -210,6 +238,22 @@ class LogRectilinearFoveator(nn.Module):
             .flatten(3, 4)                             # (C, G, ts, G*ts)
             .flatten(1, 2)                             # (C, G*ts, G*ts)
         )
+
+    def unwarp_to_crop(self, pred: torch.Tensor) -> torch.Tensor:
+        """
+        Invert the log-rectilinear warp: token space → 1280×1280 crop space.
+
+        Each crop pixel is mapped back to the unique token cell that covered it
+        during forward foveation, via a precomputed gather index.
+
+        pred: (B, N, P, P) float — predicted values in token space (P must be 16).
+              For upsampled decoder outputs, downsample to P=16 before calling.
+        Returns: (B, 1280, 1280) float.
+        """
+        B = pred.shape[0]
+        flat = pred.reshape(B, -1)                                    # (B, N*P*P)
+        idx  = self.crop_to_token_cell.unsqueeze(0).expand(B, -1)     # (B, 1280*1280)
+        return flat.gather(1, idx).reshape(B, _CROP_SIZE, _CROP_SIZE)
 
     def forward(self, *args, **kwargs):
         raise NotImplementedError(
@@ -286,6 +330,26 @@ def _self_test():
     assert fov.get_num_tokens() == 169
     assert fov.get_pattern_bounds_size() == 1280
     print("  Test 8 PASS: get_num_tokens()=169, get_pattern_bounds_size()=1280")
+
+    # ── Test 9: unwarp_to_crop round-trip ─────────────────────────────────────
+    # Set center token (6,6) = 1.0, all others = 0.0; verify crop center is 1.0
+    center_n = 6 * _GRID_SIZE + 6   # token 84
+    pred = torch.zeros(1, _GRID_SIZE * _GRID_SIZE, _TOKEN_SIZE, _TOKEN_SIZE)
+    pred[0, center_n] = 1.0
+    crop = fov.unwarp_to_crop(pred)   # (1, 1280, 1280)
+    assert crop.shape == (1, _CROP_SIZE, _CROP_SIZE), f"Test 9 FAIL: shape {crop.shape}"
+    # Center token bounding box: token_lower[84], token_upper[84]
+    tl_xy = fov._token_lower[center_n]   # (2,) [lx, ly]
+    tu_xy = fov._token_upper[center_n]   # (2,) [ux, uy]
+    lx, ly = tl_xy[0].item(), tl_xy[1].item()
+    ux, uy = tu_xy[0].item(), tu_xy[1].item()
+    center_region = crop[0, ly:uy, lx:ux]
+    assert center_region.min().item() == 1.0, f"Test 9 FAIL: center region min = {center_region.min()}"
+    periphery = crop[0, :ly, :].sum() + crop[0, uy:, :].sum()
+    assert periphery.item() == 0.0, f"Test 9 FAIL: periphery non-zero = {periphery}"
+    # Verify full coverage: every crop pixel should have been assigned
+    assert (crop[0] >= 0).all(), "Test 9 FAIL: negative values in crop"
+    print(f"  Test 9 PASS: unwarp_to_crop round-trip OK (center token → crop [{lx}:{ux}, {ly}:{uy}] = 1)")
 
     print("All tests passed.")
 
