@@ -376,10 +376,27 @@ def main():
         if is_main:
             print(f"Resumed from step {start_step}")
 
-    # ── Initial val (on resume, so we have a baseline at the resumed step) ──
+    # ── Initial val + eval (on resume, baseline at the resumed step) ────────
     if val_loader is not None and start_step > 0:
         run_val_seg(model.module, foveator_gpu, val_loader,
                     imagenet_mean, imagenet_std, device, start_step, use_wandb)
+
+    if is_main and start_step > 0 and args.eval_images > 0 \
+            and args.val_data_root and args.val_ann_file:
+        from evaluation.eval import evaluate_on_coco
+        print(f"SAM-protocol eval on {args.eval_images} COCO images...", flush=True)
+        model.module.eval()
+        sam_miou = evaluate_on_coco(
+            args.val_data_root, args.val_ann_file,
+            model.module, foveator_gpu,
+            imagenet_mean, imagenet_std, device,
+            max_images=args.eval_images,
+        )
+        model.module.train()
+        print(f"  eval/sam_miou={sam_miou:.4f}", flush=True)
+        if use_wandb:
+            import wandb
+            wandb.log({"eval/sam_miou": sam_miou}, step=start_step)
 
     # ── Training ──────────────────────────────────────────────────────────
     model.train()
