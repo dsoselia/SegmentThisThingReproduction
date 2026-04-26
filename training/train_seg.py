@@ -40,6 +40,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "repo"))
+sys.path.insert(0, str(Path(__file__).parent.parent))  # for evaluation/
 
 from segment_this_thing import (
     build_segment_this_thing_b,
