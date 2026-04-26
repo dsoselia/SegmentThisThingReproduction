@@ -1,16 +1,16 @@
 #!/bin/bash
-# Segmentation fine-tuning — actual full run, 2×H200.
-# 250K steps. Requires mae_coco_lr_actual/final.pth from pretrain.
+# Segmentation fine-tuning — actual full run, 2×H200, scavenger partition (vulcan46).
+# Race partner for finetune_coco_actual_2xh200.sh (cml-scavenger/cml35).
+# cancel_loser.sh cancels whichever is still pending once the other starts.
 #
-# Submit: sbatch slurm/finetune_coco_actual_2xh200.sh
-# With dependency: sbatch --dependency=afterok:<pretrain_jobid> slurm/finetune_coco_actual_2xh200.sh
+# Submit: sbatch slurm/finetune_coco_actual_2xh200_scavenger.sh
 
-#SBATCH --job-name=stt-seg-act-2h
-#SBATCH --output=logs/seg_actual_2xh200_%j.out
-#SBATCH --error=logs/seg_actual_2xh200_%j.err
+#SBATCH --job-name=stt-seg-act-2h-sc
+#SBATCH --output=logs/seg_actual_2xh200_scav_%j.out
+#SBATCH --error=logs/seg_actual_2xh200_scav_%j.err
 #SBATCH --open-mode=append
-#SBATCH --partition=cml-scavenger
-#SBATCH --account=cml-scavenger
+#SBATCH --partition=scavenger
+#SBATCH --account=scavenger
 #SBATCH --gres=gpu:h200-sxm:2
 #SBATCH --ntasks-per-node=2
 #SBATCH --cpus-per-task=16
@@ -40,14 +40,14 @@ ACTUAL=$(find "${LOCAL_IMAGES}" -maxdepth 1 -name '*.jpg' | wc -l)
 if [ "${ACTUAL}" -lt "${EXPECTED}" ]; then
     FREE_KB=$(df -k /tmp | awk 'NR==2 {print $4}')
     if [ "${FREE_KB}" -lt 20971520 ]; then
-        echo "[finetune_actual] ERROR: /tmp has only $((FREE_KB/1024)) MB free (need ~20 GB). Aborting."
+        echo "[finetune_actual_scav] ERROR: /tmp has only $((FREE_KB/1024)) MB free (need ~20 GB). Aborting."
         exit 1
     fi
-    echo "[finetune_actual] Staging COCO train2017 to ${LOCAL_IMAGES} (have ${ACTUAL}/${EXPECTED}) ..."
+    echo "[finetune_actual_scav] Staging COCO train2017 to ${LOCAL_IMAGES} (have ${ACTUAL}/${EXPECTED}) ..."
     rsync -a --no-perms --update "${COCO_IMAGES}/" "${LOCAL_IMAGES}/"
-    echo "[finetune_actual] Staged: $(find ${LOCAL_IMAGES} -maxdepth 1 -name '*.jpg' | wc -l) images"
+    echo "[finetune_actual_scav] Staged: $(find ${LOCAL_IMAGES} -maxdepth 1 -name '*.jpg' | wc -l) images"
 else
-    echo "[finetune_actual] Reusing cached staging at ${LOCAL_IMAGES} (${ACTUAL} images)"
+    echo "[finetune_actual_scav] Reusing cached staging at ${LOCAL_IMAGES} (${ACTUAL} images)"
 fi
 
 source /cmlscratch/dsoselia/miniconda3/etc/profile.d/conda.sh

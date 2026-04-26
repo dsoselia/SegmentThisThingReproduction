@@ -139,6 +139,104 @@ def evaluate_on_dataset(
     return sum(all_ious) / len(all_ious) if all_ious else 0.0
 
 
+def evaluate_on_coco(
+    images_dir: str,
+    ann_file: str,
+    model,
+    foveator,
+    imagenet_mean,
+    imagenet_std,
+    device: torch.device,
+    max_images: int = None,
+) -> float:
+    """
+    SAM-protocol evaluation on COCO val2017 using log-rectilinear foveation.
+
+    For each GT mask: click = pixel furthest from boundary (distance transform),
+    run model on the 1280×1280 crop, pick best mask by pred_iou head output,
+    unwarp to crop space, compare against GT cropped to same region.
+
+    Returns mean IoU across all instances.
+    """
+    import numpy as np
+    import matplotlib.image
+    from scipy.ndimage import distance_transform_edt
+    from pycocotools.coco import COCO
+    from segment_this_thing.utils import get_crop_bounds, get_centered_crop
+    from datasets import batch_foveate_images
+
+    coco = COCO(ann_file)
+    img_ids = coco.getImgIds()
+    if max_images is not None:
+        img_ids = img_ids[:max_images]
+
+    all_ious = []
+    n_images = 0
+
+    for img_id in img_ids:
+        img_info = coco.loadImgs(img_id)[0]
+        img_path = Path(images_dir) / img_info["file_name"]
+        if not img_path.exists():
+            continue
+
+        img_np = matplotlib.image.imread(str(img_path))
+        if img_np.ndim == 2:
+            img_np = np.stack([img_np] * 3, axis=-1)
+        if img_np.dtype != np.uint8:
+            img_np = (img_np * 255).astype(np.uint8)
+        image = torch.from_numpy(img_np.copy()).to(device)  # (H, W, 3) uint8
+
+        ann_ids = coco.getAnnIds(imgIds=img_id, iscrowd=False)
+        anns = coco.loadAnns(ann_ids)
+
+        for ann in anns:
+            gt_mask_np = coco.annToMask(ann).astype(bool)
+            if gt_mask_np.sum() == 0:
+                continue
+
+            dist = distance_transform_edt(gt_mask_np)
+            fy, fx = np.unravel_index(dist.argmax(), dist.shape)
+            fov_center = torch.tensor([int(fx), int(fy)], device=device)
+
+            crop_bounds = get_crop_bounds(
+                fov_center.float(), foveator.get_pattern_bounds_size()
+            ).to(device)
+            crop_hwc = get_centered_crop(image.cpu(), crop_bounds.cpu()).to(device)  # (1280,1280,3)
+
+            img_wh = torch.tensor([image.shape[1], image.shape[0]], device=device)
+            valid_mask = foveator.get_in_bounds_tokens(img_wh, crop_bounds).unsqueeze(0)  # (1, N)
+
+            tokens_u8 = batch_foveate_images(foveator, crop_hwc.unsqueeze(0))   # (1, N, 3, P, P)
+            tokens = (tokens_u8 / 255.0 - imagenet_mean) / imagenet_std
+
+            with torch.no_grad():
+                pred_masks, pred_ious = model(tokens, valid_mask)
+            # pred_masks: (1, K, N, P, P)  pred_ious: (1, K)
+
+            best_k = pred_ious[0].argmax().item()
+            best_logits = pred_masks[0, best_k].unsqueeze(0).float()       # (1, N, P, P)
+            pred_crop = foveator.unwarp_to_crop(best_logits.sigmoid())      # (1, 1280, 1280)
+            pred_bin = pred_crop[0] > 0.5
+
+            gt_mask = torch.from_numpy(gt_mask_np).to(device)
+            gt_3ch = gt_mask.unsqueeze(-1).expand(-1, -1, 3).byte() * 255
+            gt_crop = get_centered_crop(gt_3ch.cpu(), crop_bounds.cpu())[:, :, 0].to(device).bool()
+
+            inter = (pred_bin & gt_crop).sum().item()
+            union = (pred_bin | gt_crop).sum().item()
+            all_ious.append(inter / (union + 1e-6) if union > 0 else 1.0)
+
+        n_images += 1
+        if n_images % 10 == 0:
+            print(
+                f"  eval: {n_images} images, {len(all_ious)} masks,"
+                f" mIoU={sum(all_ious)/len(all_ious):.4f}",
+                flush=True,
+            )
+
+    return sum(all_ious) / len(all_ious) if all_ious else 0.0
+
+
 def main():
     parser = argparse.ArgumentParser("STT Evaluation")
     parser.add_argument("--data-root", required=True)

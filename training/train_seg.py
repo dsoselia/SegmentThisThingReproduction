@@ -210,6 +210,10 @@ def main():
                         help="Number of val images (default 64)")
     parser.add_argument("--val-interval",   type=int, default=500,
                         help="Run val every N steps (0 = disable)")
+    parser.add_argument("--eval-images",    type=int, default=0,
+                        help="COCO images for SAM-protocol full-res eval (0 = disabled)")
+    parser.add_argument("--eval-interval",  type=int, default=0,
+                        help="Steps between SAM-protocol eval runs (0 = same as val-interval)")
     parser.add_argument("--compile", action="store_true",
                         help="Use torch.compile for extra speed")
     parser.add_argument("--wandb-project", default="segment-this-thing",
@@ -320,6 +324,8 @@ def main():
             drop_last=False,
         )
         print(f"Val loader: {n_val} images, interval={args.val_interval}")
+
+    eval_interval = args.eval_interval if args.eval_interval > 0 else args.val_interval
 
     # ── Model ─────────────────────────────────────────────────────────────
     num_tokens = foveator_cpu.get_num_tokens()
@@ -482,6 +488,24 @@ def main():
         if val_loader is not None and step % args.val_interval == 0:
             run_val_seg(model.module, foveator_gpu, val_loader,
                         imagenet_mean, imagenet_std, device, step, use_wandb)
+
+        if is_main and args.eval_images > 0 and args.val_data_root and args.val_ann_file \
+                and step % eval_interval == 0:
+            from evaluation.eval import evaluate_on_coco
+            print(f"SAM-protocol eval on {args.eval_images} COCO images...", flush=True)
+            model.module.eval()
+            sam_miou = evaluate_on_coco(
+                args.val_data_root, args.val_ann_file,
+                model.module, foveator_gpu,
+                imagenet_mean, imagenet_std, device,
+                max_images=args.eval_images,
+            )
+            model.module.train()
+            print(f"  eval/sam_miou={sam_miou:.4f}", flush=True)
+            if use_wandb:
+                import wandb
+                wandb.log({"eval/sam_miou": sam_miou}, step=step)
+            dist.barrier()
 
     if is_main:
         save_checkpoint(_full_state(), os.path.join(args.output_dir, "final.pth"))
