@@ -148,6 +148,7 @@ def evaluate_on_coco(
     imagenet_std,
     device: torch.device,
     max_images: int = None,
+    return_oracle: bool = False,
 ) -> float:
     """
     SAM-protocol evaluation on COCO val2017 using log-rectilinear foveation.
@@ -171,6 +172,7 @@ def evaluate_on_coco(
         img_ids = img_ids[:max_images]
 
     all_ious = []
+    oracle_ious = []
     n_images = 0
 
     for img_id in img_ids:
@@ -213,28 +215,40 @@ def evaluate_on_coco(
                 pred_masks, pred_ious = model(tokens, valid_mask)
             # pred_masks: (1, K, N, P, P)  pred_ious: (1, K)
 
-            best_k = pred_ious[0].argmax().item()
-            best_logits = pred_masks[0, best_k].unsqueeze(0).float()       # (1, N, P, P)
-            pred_crop = foveator.unwarp_to_crop(best_logits.sigmoid())      # (1, 1280, 1280)
-            pred_bin = pred_crop[0] > 0.5
-
             gt_mask = torch.from_numpy(gt_mask_np).to(device)
             gt_3ch = gt_mask.unsqueeze(-1).expand(-1, -1, 3).byte() * 255
             gt_crop = get_centered_crop(gt_3ch.cpu(), crop_bounds.cpu())[:, :, 0].to(device).bool()
 
-            inter = (pred_bin & gt_crop).sum().item()
-            union = (pred_bin | gt_crop).sum().item()
-            all_ious.append(inter / (union + 1e-6) if union > 0 else 1.0)
+            K = pred_masks.shape[1]
+
+            def _crop_iou(k):
+                logits_k = pred_masks[0, k].unsqueeze(0).float()
+                bin_k = foveator.unwarp_to_crop(logits_k.sigmoid())[0] > 0.5
+                inter = (bin_k & gt_crop).sum().item()
+                union = (bin_k | gt_crop).sum().item()
+                return inter / (union + 1e-6) if union > 0 else 1.0
+
+            # Model-selected: pick by pred_iou head
+            best_k = pred_ious[0].argmax().item()
+            all_ious.append(_crop_iou(best_k))
+
+            # Oracle-selected: pick the mask with highest actual crop IoU
+            if return_oracle:
+                oracle_ious.append(max(_crop_iou(k) for k in range(K)))
 
         n_images += 1
         if n_images % 10 == 0:
-            print(
-                f"  eval: {n_images} images, {len(all_ious)} masks,"
-                f" mIoU={sum(all_ious)/len(all_ious):.4f}",
-                flush=True,
-            )
+            msg = (f"  eval: {n_images} images, {len(all_ious)} masks,"
+                   f" mIoU={sum(all_ious)/len(all_ious):.4f}")
+            if return_oracle and oracle_ious:
+                msg += f"  oracle={sum(oracle_ious)/len(oracle_ious):.4f}"
+            print(msg, flush=True)
 
-    return sum(all_ious) / len(all_ious) if all_ious else 0.0
+    miou = sum(all_ious) / len(all_ious) if all_ious else 0.0
+    if return_oracle:
+        oracle = sum(oracle_ious) / len(oracle_ious) if oracle_ious else 0.0
+        return miou, oracle
+    return miou
 
 
 def main():

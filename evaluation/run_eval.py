@@ -188,12 +188,14 @@ def main():
 
         print(f"\n── Seg eval (step {seg_step}) ───────────────────────────────────")
         print(f"   {args.eval_images} COCO images, SAM protocol (furthest-from-boundary click)")
-        sam_miou = evaluate_on_coco(
+        sam_miou, oracle_miou = evaluate_on_coco(
             args.val_images_dir, args.val_ann_file,
             model, foveator, imagenet_mean, imagenet_std, device,
             max_images=args.eval_images,
+            return_oracle=True,
         )
-        print(f"\n  eval/sam_miou @ step {seg_step} = {sam_miou:.4f}")
+        print(f"\n  eval/sam_miou   @ step {seg_step} = {sam_miou:.4f}  (model-selected, comparable to STT)")
+        print(f"  eval/oracle_iou @ step {seg_step} = {oracle_miou:.4f}  (best-of-K by actual crop IoU, upper bound)")
 
     # ── MAE crop-space reconstruction eval ───────────────────────────────────
     for mae_ckpt in args.mae_ckpts:

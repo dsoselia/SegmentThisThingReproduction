@@ -42,7 +42,6 @@ echo ""
 
 python evaluation/run_eval.py \
     --seg-ckpt      "${SEG_CKPT}" \
-    --mae-ckpts     "${MAE_CKPT_25K}" "${MAE_CKPT_50K}" "${MAE_CKPT_75K}" "${MAE_CKPT_LATEST}" \
     --val-images-dir "${VAL_IMAGES}" \
     --val-ann-file   "${VAL_ANN}" \
     --eval-images   500 \
