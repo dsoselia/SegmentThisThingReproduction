@@ -122,26 +122,23 @@ def eval_mae_crop(mae_ckpt_path: str, foveator, imagenet_mean, imagenet_std,
                 enc_feat, _ = encoder(tokens_masked, enc_valid)
                 recon = mae_dec(enc_feat)  # (1, N, 3*P*P)
 
-            # Denormalize both recon and target to [0,1] pixel space
+            # Step 3: unnormalize both GT and predicted tokens → [0,1] pixel range
             P = token_size
             recon_tokens = recon.float().reshape(1, num_tokens, 3, P, P)
-            # recon is in imagenet-normalized space; denormalize
             recon_pixels = (recon_tokens * imagenet_std.view(1, 1, 3, 1, 1)
                             + imagenet_mean.view(1, 1, 3, 1, 1)).clamp(0, 1)
-            orig_pixels = tokens.float().clamp(
-                (torch.zeros(3, device=device) - imagenet_mean.view(3)) / imagenet_std.view(3),
-                (torch.ones(3, device=device) - imagenet_mean.view(3)) / imagenet_std.view(3),
-            )
-            orig_pixels = (tokens.float() * imagenet_std.view(1, 1, 3, 1, 1)
-                           + imagenet_mean.view(1, 1, 3, 1, 1)).clamp(0, 1)
+            orig_pixels  = (tokens.float() * imagenet_std.view(1, 1, 3, 1, 1)
+                            + imagenet_mean.view(1, 1, 3, 1, 1)).clamp(0, 1)
 
-            # Unwarp each channel to crop space and compute MSE
-            mse_channels = []
-            for c in range(3):
-                recon_crop = foveator.unwarp_to_crop(recon_pixels[:, :, c, :, :])  # (1,1280,1280)
-                orig_crop  = foveator.unwarp_to_crop(orig_pixels[:, :, c, :, :])
-                mse_channels.append(F.mse_loss(recon_crop, orig_crop).item())
-            total_mse += sum(mse_channels) / 3
+            # Step 4: project both through the same foveated → crop-space mapping.
+            # unwarp_to_crop(B=3, N, P, P) → (3, 1280, 1280), one output per channel.
+            # Equivalent to STT's generate_foveated_visualization on both sides.
+            recon_vis = foveator.unwarp_to_crop(recon_pixels[0].permute(1, 0, 2, 3))  # (3,1280,1280)
+            orig_vis  = foveator.unwarp_to_crop(orig_pixels[0].permute(1, 0, 2, 3))   # (3,1280,1280)
+
+            # Step 5: MSE between the two (3, 1280, 1280) crop-space images
+            total_mse += F.mse_loss(recon_vis, orig_vis).item()
+            n_samples += 1
             n_samples += 1
 
             if n_samples % 50 == 0:
